@@ -1,0 +1,404 @@
+// Robot guitar player by Steve Smit - Nov 2017
+//
+// Version 24
+//
+// This version accepts bytes from a C64 via parallel transfer from
+// the user port and using PA2 on falling edge as interrupt to read 
+// the current byte (using bits on PB0 ~ 7).
+// This version relies on the C64 for play timing (where previous versions
+// used the timing capabilities of the Arduino)
+//
+// The first byte if 1 means download servo data, a 2 means setup mode
+// (or fine tuning mode), and 3 means play mode.
+//
+// Note: if not one of these go back to wait for 1, 2 or 3
+//
+// For Download Mode (1)
+//
+// This version accepts 132 bytes and loads these into an array.
+// The first 6 servos are for plucking strings, while the following 60 servos
+// will be for 'fret' servos to press on stings on the neck of the guitar.
+// Depending on time, budget and capabilities of Arduino, not all 66 will be used.
+// At the time of this writing, there are only 18 servos on the neck of the guitar
+// meaning only the first 3 frets have servos so far.
+// As there is a limitation of a single digit character on the C64 Tab screen,
+// I will likely restrict the maximum number of server rows to 9. Although mounting
+// and driving this many will be quite a challenge given the compressed space down
+// the neck of the guitar!
+//
+// For Setup Mode (2)
+//
+// The next bytes are used to control the servos to fine tune the position
+// storing the new value both in the Arduino and in the C64 (so the C64 knows
+// these values for next time). The first byte is which servo (currently 0 to
+// 23). The next bytes will be the 'first' servo position varying up or down.
+// Since I will only allow values from 1 to 128, a 255 represents exit setup for
+// that particular servo. A 254 toggles the position of the servo, while a 0
+// exits to the main menu. The C64 will store the new values table if there
+// were any changes. 
+//
+// For Play Mode (3)
+//
+// The First Byte is a paramaters byte (things like beats per minute [yet to
+// be decided]). The next bytes utilise the top 2 bits to indicate what
+// the byte is for. Here is the table for the top 2 bits: 10 = data is for
+// fret information, starting at Fret row 1 (top fret). So if there is a
+// series of bytes starting with 10 then each consecutive byte (lower
+// 6 bits) are for the next fret down, and so on. 
+// The bits of these bytes determine '0' up off the fret, '1' press down.
+// If the byte starts with 01 then this is for the 'plucking' servos.
+// The lower 6 bits are used to toggle the position of the servos over the
+// strings. So in all cases above, only the lower 6 bits (bit 0 to 5) are
+// in use. Only the difference is that the 'strumming' byte just toggles
+// the current position of the servo rather than specifying a position. 
+//
+// If the byte starts with 00 = let the previous note 'ring out' for a
+// number of beats. The number of beats is indicated in the lower 6 bits
+// of this byte. This allows a up to 63 beats wait!
+//
+// If the byte starts with 11 = END. That way we know the tune is finished.
+// All servors on the neck of the guitar should be returned to being up
+// (after a suitable delay to let the last 'note' fade out).
+//
+// At first I will be using songs that can be played based on the actual
+// available positions where servos have been installed. As at the writing
+// of this text I have eighteen servos now on the neck of the guitar. Which
+// is 3 Fret rows (named FretRows 1, 2 & 3). More will be added later.
+// 
+
+#include <Servo.h>
+#include <EEPROM.h>
+// #include <Wire.h>  // This is for support of I2C instead of parallel transfer
+// I'm also keen to try 
+
+#define myDigitalRead(pin) ((*portInputRegister(digitalPinToPort(pin)) \
+                          & digitalPinToBitMask(pin)) ? HIGH : LOW)
+#define number_of_servos 24
+int servoPins[] = {3, 4, 5, 6, 7, 8, 9, 10, 13, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36};
+Servo servos[number_of_servos];
+
+byte pos = 0;
+int i = 0;  // used for counting
+byte j = 0;  // also used for counting
+byte k = 0;  // another counter
+byte x;  // holds the current byte sent over user port
+byte y;  // holds the current menu selection
+byte p;  // holds the parameter value
+byte z = 0; // Temporary hold for servo val
+byte s = 0; // hold current servo number
+byte z1 = 0; // Temporary hold for current servo val 0
+byte z2 = 0; // Temporary hold for current servo val 1
+byte Mask = 1; // Used to do bitwise testing of bytes
+byte Fret = 0; // Holds the current Fret row
+byte Beats = 0; // Holds the number of beats for a Ring Out
+byte HB = 0; // Half Beat if 0 means haven't waited, 1 means already waited
+byte Dir1 = 0;  // Initial test if stumming 0 = top, 1 = down
+boolean byteReceived = false;  // is used to test if a byte has been received via I2C
+unsigned int previousMillis = 0; // used for timing since last beat
+float intcalc = 0;  // used for initial calcuation of Interval
+unsigned int interval = 1000;  // timing of beats (milliseconds). Can be set by parameter byte
+unsigned int currentms = 0;
+byte StrumPos[] = {0, 0, 0, 0, 0, 0}; // holds the current position of the strumming servos
+byte FretRowPos[10];
+// byte SongArray[800]; // Will hold the song data for this testing
+byte ServoVal[66][2];
+const byte ledPin = 13;
+const byte interruptPin = 2; // connect to C64 User Port pin M (PA2)
+volatile byte state = HIGH;
+
+void setup() {
+i = 0;
+for (j=0; j<48; j=j+2) {
+  ServoVal[i][0]=EEPROM.read(j);
+  servos[i].write(ServoVal[i][0]);
+  i = i + 1;
+}
+Serial.begin(57600);
+while (!Serial) {
+// wait for serial port to connect. Needed for native USB port only
+}
+delay(1);
+Serial.println("initialising");
+i = 0;
+for (j=0; j<132; j=j+2) {
+  ServoVal[i][1]=EEPROM.read(j+1);
+  Serial.print("ServoVal[");
+  Serial.print(i);
+  Serial.print("][0] = ");
+  Serial.print(ServoVal[i][0]);
+  Serial.print("  ServoVal[");
+  Serial.print(i);
+  Serial.print("][1] = ");
+  Serial.println(ServoVal[i][1]);
+  i=i+1;
+}
+ServosToStartPos();
+Serial.println("Initialising Srumming Servos Servos 0 to 5");
+delay (5000);
+for (s=0; s<5; s++) { // Initialise stumming servos first
+  servos[s].attach(servoPins[s]);
+  servos[s].write(ServoVal[s][0]);
+}
+delay (5000);
+Serial.println("First Fret Servos - Servos 6 to 11");
+for (s=5; s<11; s++) { // Initialise Fret 1
+  servos[s].write(ServoVal[s][0]);
+  servos[s].attach(servoPins[s]);
+}
+delay (5000);
+Serial.println("Second Fret Servos - Servos 12 to 17");
+for (s=12; s<17; s++) { // Initialise Fret 2
+  servos[s].write(ServoVal[s][0]);
+  servos[s].attach(servoPins[s]);
+}
+delay (5000);
+Serial.println("Third Fret Servos - Servos 18 to 23");
+for (s=18; s<23; s++) { // Initialise stumming servos first
+  servos[s].write(ServoVal[s][0]);
+  servos[s].attach(servoPins[s]);
+}
+delay (5000);
+  pinMode(ledPin, OUTPUT);
+  pinMode(47, INPUT_PULLUP); // PB0 User Port pin C
+  pinMode(48, INPUT_PULLUP); // PB1 User Port pin D
+  pinMode(49, INPUT_PULLUP); // PB2 User Port pin E
+  pinMode(50, INPUT_PULLUP); // PB3 User Port pin F
+  pinMode(51, INPUT_PULLUP); // PB4 User Port pin H
+  pinMode(52, INPUT_PULLUP); // PB5 User Port pin J
+  pinMode(53, INPUT_PULLUP); // PB6 User Port pin K
+  pinMode(54, INPUT_PULLUP); // PB7 User Port pin L
+  pinMode(interruptPin, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(interruptPin), ReadByte, FALLING);
+// The following is when using I2C, which I did use with the Cassiopei but this code will
+// use parallel transfer from the C64 User Port via an Optoisolation board (to protect the C64).
+// Slave address is 5. But on Cassiopei use 10 (because address starts at bit 1 not 0)
+// Wire.begin(5); 
+// Attach a function to trigger when something is received.
+// Wire.onReceive(receiveEvent);
+Serial.println("initialation complete");
+}
+
+
+// called by interrupt service routine when incoming data arrives
+void ReadByte() {
+  x = 0;
+  state = !state;
+  x  = myDigitalRead (47)  
+         | myDigitalRead (48) << 1  
+         | myDigitalRead (49) << 2
+         | myDigitalRead (50) << 3
+         | myDigitalRead (51) << 4
+         | myDigitalRead (52) << 5
+         | myDigitalRead (53) << 6
+         | myDigitalRead (54) << 7;  
+  x = x ^ 255; // Use if bits need to be inverted
+  byteReceived = true;
+//  Serial.println(x);
+}
+
+void ServosToStartPos() {
+  Serial.println("Now moving all servos to initial positions");
+  for (i=0; i<number_of_servos; i++) {
+       servos[i].write(ServoVal[i][0]);
+  }
+  for (i=0; i<6; i++) { // sets the initial position of all six stumming servos
+       StrumPos[i] = 0; // The positions are 0 and 1, being the values in the corresponding
+  } // ServoVal[x][y], where x is the servo (0 to 5 are the strumming servos) and y holds the pos
+}
+
+void loop() { 
+// Outter loop is Main Wait Menu
+// A Byte from User Port (the x value) is either '1' = downloading all servo values
+// a '2' = Enter Setup (fine tuning) Mode, or
+// a '3' = Play mode. In the play mode, receiving a 192 will exit back to main loop
+// In the Setup Mode a 254 = toggle and 255 = exit
+if(byteReceived) { // enters here only if a byte is received
+  byteReceived = false;
+  y = x;
+  if (y == 1) { // Execute the Load Servo Values routine
+     // The following loops are to collect 132 bytes
+     // while (1 < Wire.available()) { // loop through all but the last
+     y = 0;
+     Serial.println("Entered Servo Load Mode");
+     for (i=0; i<66; i++) { 
+       for (j=0; j<2; j++) {
+         while (not byteReceived) {
+          delay(1);
+         }
+         byteReceived = false;
+         ServoVal[i][j] = x;
+         EEPROM.write (i*2 +j,x);
+         Serial.print(" Servo ");         // print the byte value
+         Serial.print(i);
+         Serial.print(" val ");
+         Serial.print(j+1);
+         Serial.print(" ");
+         Serial.print(ServoVal[i][j]);
+        }
+         Serial.println ();
+      }      
+  ServosToStartPos();
+  Serial.println ("All 132 Bytes received!");
+  x = 0;
+  byteReceived = false;
+  y = 0;
+  i = 0;
+  s = 0;
+  }
+  if (y == 2) { // Execute the Setup Mode
+     // The following routine allows adjustment of any servo
+     // from 0 to 65, where 0 is the first 'e' string plectrum
+     y = 0;
+     x = 0;
+     byteReceived = false;
+     Serial.println("Entered Servo Fine Adjust Mode");
+     do {
+       while (not byteReceived) { //wait for next byte (servo number)
+        delay(1);
+       }
+       if (x != 255) {
+        s = x; // s = the current servo within this loop starting at 0
+       }
+       byteReceived = false;
+       if (x == 255) {
+        ServosToStartPos();
+        break;
+       }
+       j = 0;
+       servos[s].write(ServoVal[s][0]);
+       // Enter loop for servo toggling position or changing values
+       do {
+         while (not byteReceived) { //wait for next byte (Value, Toggle or Exit)
+          delay(1);
+         }
+         byteReceived = false;
+         if (x != 255) {
+           z = x; // z becomes the byte(s) after servo (i) is known
+         }
+         if (z == 254) { // First check if a toggle byte has been sent
+           j = j+1;
+           if (j == 2) {
+              j = 0;
+           }
+           Serial.println("Toggled!");
+           z = ServoVal[s][j];
+         }
+         ServoVal[s][j] = z; // Set the appropriate servo val 
+         z1 = ServoVal[s][0];
+         z2 = ServoVal[s][1];
+         servos[s].write(ServoVal[s][j]);
+         } while (x != 255);
+       } while (x != 255);
+       ServosToStartPos();
+       EEPROM.write(s*2,z1);
+       EEPROM.write(s*2+1,z2);
+  }
+  if (y == 3) { // Execute Play Mode  
+    y = 0;
+    x = 0;
+    byteReceived = false;
+    Serial.println ("Entered Play Mode!");
+    // First, let's read the 'Parameter' byte
+      while (not byteReceived) { //wait for next byte (parameter byte)
+        delay(1);
+      }
+      // The Paramater Byte will hold BPM
+      p = x;  // P now holds the parameter value
+      byteReceived = false;
+      i = 0;
+      Fret = 0;
+      do { // Outer loop after reading the first parameter byte. Exit is when top bits are 11
+        while (not byteReceived) { //wait for byte
+         delay(1);
+        }
+        byteReceived = false;
+        Serial.println(x);
+        i = i + 1;
+        p = x & B11000000;
+        x = x & B00111111;
+// **************************
+// ** Fret Byte Processing **
+// **************************
+       if (p == 128) { // Fret Byte processing
+         Mask = 1;
+         for (k = 0; k<6 ; k++) { // A loop to set the servo position for each Fret row
+           j = Fret * 6;
+           j = j + 6;
+           j = j + k;
+           if (x & Mask) { // Test each bit for Frets down = 1
+             FretRowPos[k] = 1;
+             }
+             else {
+             FretRowPos[k] = 0;
+             }
+           Mask <<= 1;
+           servos[j].write(ServoVal[j][FretRowPos[k]]); // write the fret servos
+         }     
+           Fret = Fret + 1;
+         }
+// *********************************
+// ** Processing 'Ring Out' bytes **
+// *********************************
+       if (p == 0) { // this was a carry over from previous version
+                     // now that the C64 will be controlling timing, this part of the
+                     // software has become obsolete. In fact there is no need to receive
+                     // this commmand type, as all the C64 has to do is hold off senging
+                     // Pluck or Fret bytes until the 'ring out' period has been reached
+         Fret = 0; // reset Fret back to start row
+         y = 0;
+         x = 0;
+         // HB = 0; // reset Half Beat to zero (i.e. not yet performed for fret routine)
+         // Beats = x & B00111111; // Mask off the number of beats to ring out
+         // Serial.print("Ring Out Byte = ");
+         // Serial.println(x);
+         // for (k=0; k<Beats; k++) {
+         //  currentms = millis();
+         //  while (currentms - previousMillis <= interval) {
+         //  currentms = millis();
+         //  delay (2);
+         //  }
+         // previousMillis = currentms;
+         // }
+       }
+// ***************************
+// ** Test for a Pluck byte **
+// ***************************
+       if (p == 64) { 
+         Fret = 0; // reset Fret back to start row
+         x = x & B00111111; // mask off the lowest 6 bits of the pluck byte
+         Mask = 1;     
+           for (k = 0; k<6; k++) { // A loop to check for toggles
+             if (x & Mask) { // Test each bit for toggling
+               if (StrumPos[k] == 0) {
+                   StrumPos[k] = 1;
+                 }
+                 else {
+                   StrumPos[k] = 0;
+                 }
+               z = ServoVal[k][StrumPos[k]];
+               // Serial.print("Servo = ");
+               // Serial.print(k);
+               // Serial.print(" Pos ");
+               // Serial.print(StrumPos[k]);
+               servos[k].write(z);
+               // Serial.print(" = ");
+               // Serial.println(z);
+             }   
+             Mask <<= 1;
+           }
+         }
+       } while (p != 192);
+       Serial.println("End of Song. 6 beats delay...");
+       for (i=0; i<12; i++) { // delay for 6 beats and return all servos
+       currentms = millis();
+       while (currentms - previousMillis <= interval) {
+         currentms = millis();
+         delay (2);
+         }
+       previousMillis = currentms;
+       }
+       Serial.println("The End");
+       ServosToStartPos();
+      }
+    }
+}

@@ -1,0 +1,847 @@
+(* Robot Guitar by Steve Smit 21-11-2017 v2.0z *) 
+(* Sends robot commands and data to an Arduino *)
+(* Mega via the Commodore 64 User Port *)
+(* Written in G-Pascal *)  
+(* %a$3600 *)
+ 
+const
+  cr   = 13;
+  areg = $2b2;
+  xreg = $2b3;
+  yreg = $2b4;
+  cc   = $2b1;
+  vic = 53248;
+  setlfs = $ffba;
+  setnam = $ffbd;
+  saveit = $ffd8;
+  loadit = $ffd5;
+  readst = $ffb7;
+  fillrow3 = $1ef0;
+  moveup = $1e9f;
+  blanksong = $1e73;
+
+var  
+  songlength, (* Song length in notes, i.e. x3 in bytes *)
+  sngpos, (* next note in current song *)
+  boxpos : integer ; (* box position over currently playing note *)
+  u, (* highest fret row of current tablature note *)
+  h, (* previous highest fret row *)
+  e, (* last key pressed or mouse action *)
+  row1, (* row position within current song *)
+  tempo, (* tempo speed *)
+  hb, (* number of jiffy cycles per note at current tempo *)
+  prex, (* previous x position of the cursor *)
+  prey, (* previous y position of the cursor *)
+  cursx, (* current x position of the cursor *)
+  cursy, (* current x position of the cursor *)
+  length, (* length of file name of current song *)
+  modified, (* flag, has current song been modified yet? *)
+  x : char ; (* holds command or data byte to send to robot *)
+  servo1, servo2 : array [66] of char ; (* holds position values of servos *)
+  strval : array [6] of char ; (* holds tablature values at current note *)
+  name1, name2 : array [20] of char; (* song filename arrays *)
+
+procedure mcfiles; (* loading files needed and init VIC chip *)
+
+begin
+  load (8,fillrow3,0,"fillrow3");
+  load (8,moveup,0,"moveup");
+  load (8,blanksong,0,"blanksong"); 
+  load (8,$0e00,0,"mouse.pointer");
+  load (8,$c100,0,"mouse64.bin");
+  memc [vic + 21] := 1;
+  memc [vic + 39] := 1;
+  memc [vic] := 100;
+  memc [vic + 1] := 100;
+  memc [vic + 16] := 0;
+  memc [2040] := 56;
+  call ($c100)
+end;
+
+procedure initspritebox;
+
+begin 
+  definesprite (253,$ffc000,$804000,$804000, $804000,
+  $804000, $804000, $804000, $804000, $804000, $804000,
+  $804000, $804000, $804000, $804000, $804000, $804000,
+  $804000, $804000, $804000, $804000, $804000);
+  sprite (2,2,253,2,1,7);
+  definesprite (254, $804000, $804000, $804000, $804000,
+  $804000, $804000, $804000, $804000);
+  sprite (3,2,254,3,1,7);
+  definesprite (255, $804000, $804000, $804000, $804000,
+  $804000, $804000, $804000, $804000, $804000, $804000,
+  $804000, $804000, $804000, $804000, $804000, $804000,
+  $804000, $804000, $804000, $804000, $ffc000);
+  sprite (4,2,255,4,1,7);
+  positionsprite (2,39,73);
+  positionsprite (3,39,94);
+  positionsprite (4,39,102);
+  sprite (2,7,1);
+  sprite (3,7,1);
+  sprite (4,7,1);
+  boxpos := 39
+end; 
+
+procedure userportinit; 
+ 
+begin  
+  memc [56579] := 255;  
+  memc [56578] := memc [56578] or 4; 
+  memc [56576] := memc [56576] or 4;
+  memc [56577] := 0 
+end ; 
+ 
+procedure sendbyte(x); 
+
+var i : char;
+ 
+begin  
+  memc [56577] := x;
+  memc [56576] := memc [56576] and 251;
+  memc [56576] := memc [56576] or 4 
+end ; 
+
+procedure resettime;
+
+begin
+  mem[$2b2] := 0;
+  call ($ffdb)
+end;
+
+procedure waiting(hb);
+
+begin
+  while memc[$a2] < hb do;
+end;
+
+procedure flashoff;
+
+var a : char;
+
+begin
+  a := memc[1023 + prex + (prey - 1) * 40];
+  memc[1023 + prex + (prey - 1) * 40] := a and $7f
+end;
+
+procedure readstrval(curpos);
+
+var i : char ;
+
+begin 
+  for i := 0 to 2 do 
+  begin 
+  strval[i * 2] := memc [curpos + i] shr 4;
+    if strval[i * 2] < 10 then 
+      if strval[i*2] > u then u := strval[i*2];
+  strval[i * 2 + 1] := memc [curpos + i] and $0f;
+  if strval[i * 2 + 1] < 10 then 
+    if strval[i * 2 + 1] > u then u := strval[i * 2 + 1];
+  end ;
+end ;
+
+procedure loadscreen(rowval); 
+ 
+var j, i : integer ; 
+    x, y : char;
+ 
+begin  
+  j := songlength - rowval * 32;
+  if j < 0 then j := 0;
+  i := $2000 + rowval * 96;
+  if j > 96 then j := 96;
+  if j < 33 then
+    begin
+    memc [$fd] := 32;
+    memc [$fb] := i;
+    memc [$fc] := i shr 8;
+    call (fillrow3);
+    call (moveup);
+    memc [$fd] := 0;
+    call (fillrow3);
+    call (moveup)
+    end 
+  else 
+  if j < 65 then 
+    begin
+    memc [$fd] := 32;
+    memc [$fb] := i;
+    memc [$fc] := i shr 8;
+    call (fillrow3);
+    call (moveup);
+    j := j - 32;
+    memc [$fd] := 32;
+    i := i + 96;
+    memc [$fb] := i;
+    memc [$fc] := i shr 8;
+    call (fillrow3);
+    call (moveup);
+    memc [$fd] := 0;
+    call (fillrow3)
+    end 
+  else (* all 3 rows have notes *)
+    begin
+    memc [$fd] := 32;
+    memc [$fb] := i;
+    memc [$fc] := i shr 8;
+    call (fillrow3);
+    call (moveup);
+    j := j - 32;
+    memc [$fd] := 32;
+    i := i + 96;
+    memc [$fb] := i;
+    memc [$fc] := i shr 8;
+    call (fillrow3);
+    call (moveup);
+    j := j - 32;
+    memc [$fd] := 32;
+    i := i + 96;
+    memc [$fb] := i;
+    memc [$fc] := i shr 8;
+    call (fillrow3)
+    end ;
+  y := 3;
+  x := 2;
+  for i:= 1 to 12 do
+  begin
+    cursor (y,x);
+    write ("    ");
+    cursor (y,x);
+    write (rowval * 4 + i);
+    x := x + 9;
+    if x > 29 then
+    begin
+      x := 2;
+      y := y + 7
+    end
+  end;
+  cursor (4,1);
+  writeln ("e", chr(176));
+  write ("B", chr(171));
+  cursor (cursy, cursx)
+end;
+
+procedure movebox;
+
+begin
+  boxpos := boxpos + 8;
+  case boxpos of
+    103 : boxpos := 111;
+    175 : boxpos := 183;
+    247 : boxpos := 255;
+    319 : begin
+          row1 := row1 + 1;
+          boxpos := 39;
+          if row1 > 50 then row1 := 50;
+          loadscreen(row1)
+          end
+  end ;
+  positionsprite (2,boxpos,73);
+  positionsprite (3,boxpos,94);
+  positionsprite (4,boxpos,102)
+end;  
+
+procedure playsong(startpos);
+
+var  mempos : integer ;
+  i, j, bit, pluck : char ;
+
+begin 
+  flashoff;
+  h := 0;
+  initspritebox;
+  sendbyte(3);
+  sendbyte(tempo);
+  sngpos := startpos;
+  while sngpos < songlength do 
+  begin 
+    resettime;
+    mempos := sngpos * 3 + $2000;
+    if mem [mempos] = $aaaaaa then 
+      begin 
+      sendbyte(1);
+      waiting(hb)
+      end 
+    else 
+      begin 
+      u := 0;
+      pluck := 64;
+      readstrval(mempos);
+      if u > h then h := u;
+      for i := 0 to h do 
+      begin 
+        bit := 1;
+        x := 128;
+        for j := 0 to 5 do 
+        begin 
+          if strval[j] < 10 then 
+          begin 
+            if strval[j] = i then 
+            begin 
+              x := x or bit;
+              pluck := pluck or bit
+            end ;
+          end ;
+          bit := bit shl 1
+        end ;
+        if i > 0 then sendbyte(x);
+      end ;
+      waiting (hb shr 1);
+      sendbyte (pluck);
+      waiting(hb shr 1)
+    end ;
+    sngpos := sngpos + 1;
+    h := u;
+    movebox
+  end ;
+  waiting(120);
+  sendbyte(192);
+  sprite (2,7,0);
+  sprite (3,7,0);
+  sprite (4,7,0);
+  row1 := 0;
+  sngpos := 0;
+  loadscreen(row1)
+end ;
+
+procedure getfilename;
+
+var i, got_cr : char;
+
+begin
+  cursor (2,10);
+  write ("                      ");
+  cursor (2,11);
+  write ("Filename?:");
+  read (name1);
+  got_cr := 0;
+  for i := 0 to 20 do
+    if not got_cr then
+    begin
+      name2[20-i] := name1[i];
+      if name1[i] = cr then
+      begin
+        length := i;
+        got_cr := 1
+      end ;
+    end ;
+    memc[areg] := 1;
+    memc[xreg] := 8;
+    memc[yreg] := 0;
+    call (setlfs);
+    memc[areg] := length;
+    memc[xreg] := address (name2[20]);
+    memc[yreg] := address (name2[20]) shr 8;
+    call (setnam);
+    memc[$6a] := $00;
+    memc[$6b] := $20
+end;
+
+procedure savesong;
+
+var i : char;
+
+begin
+  cursx := prex;
+  cursy := prey;
+  repeat
+    getfilename;
+    memc [areg] := $6a; (* register *)
+    memc[xreg] := $2000 + songlength * 3;
+    memc[yreg] := ($2000 + songlength * 3) shr 8;
+    cursor (2,1);
+    call (saveit);
+  until prex = prex;
+  cursor (1,18);
+  for i := 0 to length do 
+    write (chr (name1[i]));
+  cursor (2,11);
+  writeln ("Songlength:",songlength,"              ");
+  writeln ("              ");
+  modified := 0;
+  row1 := 0;
+  loadscreen(row1)
+end ;
+
+procedure loadsong;
+
+var i : char;
+
+begin
+  flashoff;
+  repeat
+    getfilename;
+    memc [areg] := $0; (* 0 = load *)
+    memc[xreg] := $00; (* start address *)
+    memc[yreg] := $20;
+    call (loadit)
+  until prex = prex;
+  songlength := ((memc [yreg] shl 8 + memc [xreg]) - $1fff) / 3;
+  cursor (1,18);
+  for i := 0 to length do 
+    write (chr (name1[i]));
+  cursor (2,11);
+  write ("Songlength:",songlength,"             ");
+  row1 := 0;
+  modified := 0;
+  loadscreen(row1)
+end ;
+   
+procedure musicscreen; 
+ 
+var i, j : char; 
+  
+begin 
+  row1 := 0;
+  cursx := 3;
+  cursy := 4;
+  prex := 3;
+  prey := 4;
+  write (chr(147));
+  load (8, $400, 0, "guitarscreen");
+  memc [55340] := 7; 
+  memc [55344] := 7; 
+  memc [56216] := 7; 
+  memc [56229] := 7; 
+  memc [56235] := 7; 
+  memc [56254] := 7;
+  memc [55774] := 7; 
+  memc [55414] := 7; 
+  memc [55534] := 7; 
+  memc [55654] := 7;
+  cursor (2,7);
+  write (tempo);
+  cursor (2,11);
+  write ("Songlength:", songlength);
+  loadscreen (0);
+  cursor (cursy,cursx) 
+end; 
+
+procedure cursorwrapr;
+
+begin 
+  cursx := 3; 
+  cursy := cursy + 7;
+  if cursy > 23 then 
+  begin
+    cursy := 23;
+    row1 := row1 + 1;
+    if row1 > 50 then row1 := 50;
+    loadscreen (row1)
+  end;
+end;
+ 
+procedure cursorwrapl;
+
+begin
+  cursx := 37;
+  if cursy > 10 then
+    begin
+      cursy := cursy - 7
+    end
+    else
+      begin
+      if row1 > 0 then
+        begin
+        row1 := row1 - 1; 
+        loadscreen (row1)
+        end
+      end
+end;
+
+procedure cursordown; 
+ 
+begin  
+  cursy := cursy + 1; 
+  case cursy of  
+  10 : cursy := 11;
+  17 : cursy := 18;
+  24 : begin
+       cursy := 18;
+       row1 := row1 + 1;
+       if row1 > 50 then row1 := 50;
+       loadscreen (row1)
+       end
+  end
+end ; 
+ 
+procedure cursorup; 
+ 
+begin  
+  cursy := cursy - 1; 
+  case cursy of 
+  10 : cursy := 9;
+  17 : cursy := 16;
+  3 :  begin
+         cursy := 4;
+         if row1 > 0 then
+         begin
+           row1 := row1 - 1;
+           loadscreen (row1)
+         end
+       end
+  end
+end ; 
+ 
+procedure cursorright; 
+ 
+begin  
+  cursx := cursx + 1; 
+  case cursx of  
+  11 : cursx := 12; 
+  20 : cursx := 21; 
+  29 : cursx := 30;
+  38 : cursorwrapr
+  end ; 
+end ; 
+ 
+procedure cursorleft; 
+ 
+begin  
+  cursx := cursx - 1; 
+  case cursx of
+  2 : cursorwrapl;  
+  11 : cursx := 10; 
+  20 : cursx := 19; 
+  29 : cursx := 28 
+  end ; 
+end ; 
+ 
+procedure from18to23(i);
+
+begin
+  i := i + $2000;
+  case cursy of
+    18 : memc[i] := memc [i] and $0f + (e shl 4);
+    19 : memc[i] := memc [i] and $f0 + e;
+    20 : memc[i + 1] := memc [i + 1] and $0f + (e shl 4);
+    21 : memc[i + 1] := memc [i + 1] and $f0 + e;
+    22 : memc[i + 2] := memc [i + 2] and $0f + (e shl 4);
+    23 : memc[i + 2] := memc [i + 2] and $f0 + e
+  end
+end;
+
+procedure from11to16(i);
+
+begin
+  i := i + $2000;
+  case cursy of
+    11 : memc[i] := memc [i] and $0f + (e shl 4);
+    12 : memc[i] := memc [i] and $f0 + e;
+    13 : memc[i + 1] := memc [i + 1] and $0f + (e shl 4);
+    14 : memc[i + 1] := memc [i + 1] and $f0 + e;
+    15 : memc[i + 2] := memc [i + 2] and $0f + (e shl 4);
+    16 : memc[i + 2] := memc [i + 2] and $f0 + e
+  end
+end;
+
+procedure from4to9(i);
+
+begin
+  i := i + $2000;
+  case cursy of
+    4 : memc[i] := memc [i] and $0f + (e shl 4);
+    5 : memc[i] := memc [i] and $f0 + e;
+    6 : memc[i + 1] := memc [i + 1] and $0f + (e shl 4);
+    7 : memc[i + 1] := memc [i + 1] and $f0 + e;
+    8 : memc[i + 2] := memc [i + 2] and $0f + (e shl 4);
+    9 : memc[i + 2] := memc [i + 2] and $f0 + e
+  end
+end;
+
+procedure writenote;
+
+var  i, j : integer;
+
+begin
+  modified := 1;
+  if e = 32 then e:= 96;
+  write (chr(e));
+  if e = 96 then e := $a;
+  if e > 47 then e := e - 48;
+  if cursy > 17 then
+    begin
+    if cursx > 29 then
+      begin
+      i := ((row1 + 2) * 32 + cursx - 6) * 3;
+      from18to23(i)
+      end
+    else
+      if cursx > 20 then
+      begin
+      i := ((row1 + 2) * 32 + cursx - 5) * 3;
+      from18to23(i)
+      end
+    else
+      if cursx > 10 then
+      begin
+      i := ((row1 + 2) * 32 + cursx - 4) * 3;
+      from18to23(i)
+      end
+    else
+      begin
+      i := ((row1 + 2) * 32 + cursx - 3) * 3;
+      from18to23(i)
+      end
+    end
+  else
+  if cursy > 10 then
+    begin
+    if cursx > 29 then
+      begin
+      i := ((row1 + 1) * 32 + cursx - 6) * 3;
+      from11to16(i)
+      end
+    else
+      if cursx > 20 then
+      begin
+      i := ((row1 + 1) * 32 + cursx - 5) * 3;
+      from11to16(i)
+      end
+    else
+      if cursx > 10 then
+      begin
+      i := ((row1 + 1) * 32 + cursx - 4) * 3;
+      from11to16(i)
+      end
+    else
+      begin
+      i := ((row1 + 1) * 32 + cursx - 3) * 3;
+      from11to16(i)
+      end
+    end
+  else
+    begin
+    if cursx > 29 then
+      begin
+      i := (row1 * 32 + cursx - 6) * 3;
+      from4to9(i)
+      end
+    else
+      if cursx > 20 then
+      begin
+      i := (row1 * 32 + cursx - 5) * 3;
+      from4to9(i)
+      end
+    else
+      if cursx > 10 then
+      begin
+      i := (row1 * 32 + cursx - 4) * 3;
+      from4to9(i)
+      end
+    else
+      begin
+      i := (row1 * 32 + cursx - 3) * 3;
+      from4to9(i)
+      end;
+    end;
+  i := (i + 2) / 3;
+  if i + 1 > songlength then songlength := i + 1;
+  cursor (2,22);
+  write ("    ");
+  cursor (2,22);
+  write (songlength);
+  cursor (cursy,cursx)
+end;  
+
+procedure wipe;
+
+begin
+  call (blanksong);
+  row1 := 0;
+  songlength := 0;
+  cursor (1,18);
+  write ("                     ");
+  cursor (2,11);
+  write ("Songlength:", songlength, "                 ");
+  cursx := prex;
+  cursy := prey;
+  loadscreen(0)
+end;
+
+procedure wipesong;
+
+var w : char;
+
+begin
+  prex := 3;
+  prey := 4;
+  if modified = 1 then
+    begin
+      cursor (2,11);
+      write ("Changes not saved, wipe(Y/N)");
+      read (w);
+      if w = 89 then wipe
+      else
+        begin
+          cursor (2,11);
+          write ("Songlength:", songlength, "                ")
+        end
+    end
+    else wipe
+end; 
+
+procedure mouseaction;
+
+var x, y : integer;
+
+begin
+  x := (cursy - 1) * 40 + cursx;
+  if x < 123 then
+    begin
+      cursx := prex;
+      cursy := prey;
+      case x of
+        45 : begin 
+           tempo := tempo + 1;
+           if tempo > 255 then tempo := 255;
+           cursor (2,6);
+           if tempo < 100 then write (" ");
+           write (tempo);
+           y := 50 * 60 / tempo;
+           hb := y
+           end;
+        49 : begin
+           tempo := tempo - 1;
+           if tempo < 10 then tempo := 10;
+           cursor (2,6);
+           if tempo < 100 then write (" ");
+           write (tempo);
+           y := 50 * 60 / tempo;
+           hb := y
+           end;
+        119 : loadsong
+      end
+    end
+  else 
+  if x < 360 then
+    begin
+      case x of
+        131, 140, 149, 158, 159, 160,
+        161, 162, 171, 180, 189, 198, 199, 200,
+        201, 202, 211, 220, 229, 238,
+        241, 242, 251, 260, 269, 278,
+        281, 282, 291, 300, 309, 318, 319, 320,
+        321, 322, 331, 340, 349, 358 : begin
+          cursx := prex;
+          cursy := prey
+          end;
+        359 : ;
+        239, 240, 279, 280 : savesong
+      end
+    end
+  else
+  if x < 403 then
+    begin
+      cursx := prex;
+      cursy := prey
+    end
+  else
+  if x < 638 then
+    begin
+      case x of
+        411, 420, 429, 438, 439, 440,
+        441, 442, 451, 460, 469, 478,
+        481, 482, 491, 500, 509, 518,
+        521, 522, 531, 540, 549, 558, 559, 560,
+        561, 562, 571, 580, 589, 598, 599, 600,
+        601, 602, 611, 620, 629 : begin
+          cursx := prex;
+          cursy := prey
+          end;
+        479, 480, 519, 520 : wipesong
+      end
+    end
+  else
+  if x < 683 then
+    begin
+      cursx := prex;
+      cursy := prey
+    end
+  else
+  if x < 910 then
+    begin
+      case x of
+        691, 700, 709, 718, 719, 720,
+        721, 722, 731, 740, 749, 758, 759, 760,
+        761, 762, 771, 780, 789, 798, 799, 800,
+        801, 802, 811, 820, 829, 838, 839, 840,
+        841, 842, 851, 860, 869, 878, 879, 880,
+        881, 882, 891, 900, 909 : begin
+          cursx := prex;
+          cursy := prey
+          end
+      end
+    end
+  else
+  if x > 917 then
+    begin
+      cursx := prex;
+      cursy := prey;
+      case x of
+        933, 934, 935, 936, 937 : playsong(row1 * 32)
+      end
+    end
+end;
+
+procedure mouseclick;
+
+var x, y : integer;
+
+begin
+  prex := cursx;
+  prey := cursy; 
+  x := (memc[vic + 16] and 1) * 256 + memc[vic] - 24;
+  if x < 0 then x := 0;
+  x := x * 40 / 320 + 1;
+  cursx := x;
+  y := (memc[vic + 1]) - 50;
+  if y < 0 then y := 0;
+  y := y * 25 / 200 + 1;
+  cursy := y;
+  mouseaction;
+  cursor (cursy,cursx)
+end;
+
+procedure editscreen;
+
+begin  
+  repeat  
+    read (e); 
+    case e of  
+      160 : mouseclick; 
+      17 : cursordown; 
+      145 : cursorup; 
+      157 : cursorleft; 
+      29 : cursorright;
+      67 : ;
+      80 : playsong(row1 * 32);
+      83 : savesong;
+      76 : loadsong;
+      87 : wipesong;
+      32, 48, 49, 50, 51, 52, 53, 54, 55 : writenote;
+      66 :
+    end ; 
+    flashoff;
+    cursor (cursy,cursx); 
+    prex := cursx; 
+    prey := cursy
+  until e = 88
+end ; 
+ 
+(* start of main program *) 
+ 
+begin  
+  h := 0;
+  modified := 0;
+  tempo := 60;
+  hb := 50 * 60 / tempo;
+  mcfiles;
+  call (blanksong);
+  songlength := 0;
+  sngpos := 0;
+  userportinit;
+  musicscreen;
+  editscreen
+end . 
+
